@@ -4,11 +4,13 @@
 MCP memPalace Integration v1.1
 Обеспечивает доступ к внешнему пакету mempalace через CLI.
 Поддерживает инициализацию, индексацию и поиск.
+Добавлено: mempalace_add – добавление одного документа по тексту.
 """
 import subprocess
 import json
 import os
 import hashlib
+import uuid
 from pathlib import Path
 from typing import Dict, Optional, List
 from mcp_shared import (
@@ -20,7 +22,7 @@ __mcp_plugin__ = {
     "version": "1.1.0",
     "description": "Интеграция с memPalace – семантическая память для кода и чатов",
     "dependencies": ["mempalace"],
-    "on_load": lambda: _log("[mempalace] Loaded. Use mempalace_init/mine/search."),
+    "on_load": lambda: _log("[mempalace] Loaded. Use mempalace_init/mine/search/add."),
     "on_unload": lambda: _log("[mempalace] Unloaded.")
 }
 
@@ -53,12 +55,10 @@ def _get_folder_hash(folder_path: str) -> str:
     hasher = hashlib.md5()
     try:
         for root, dirs, files in os.walk(folder_path):
-            # Сортируем для детерминизма
             for f in sorted(files):
                 file_path = os.path.join(root, f)
                 try:
                     stat = os.stat(file_path)
-                    # Учитываем имя файла, mtime и размер
                     hasher.update(f.encode())
                     hasher.update(str(stat.st_mtime).encode())
                     hasher.update(str(stat.st_size).encode())
@@ -108,7 +108,6 @@ def mempalace_mine(path: Optional[str] = None, mode: str = "files", force: bool 
     except PermissionError as e:
         return {"status": "error", "message": str(e)}
 
-    # --- Проверка хеша (если не force) ---
     hash_file = path_obj / ".mempalace_hash"
     current_hash = _get_folder_hash(str(path_obj))
     
@@ -128,7 +127,6 @@ def mempalace_mine(path: Optional[str] = None, mode: str = "files", force: bool 
 
     result = _run_mempalace(["mine", str(path_obj), "--mode", mode], timeout=600)
     if result["success"]:
-        # Сохраняем новый хеш
         try:
             with open(hash_file, 'w') as f:
                 f.write(current_hash)
@@ -148,10 +146,7 @@ def mempalace_mine(path: Optional[str] = None, mode: str = "files", force: bool 
 
 def mempalace_search(query: str, project_path: Optional[str] = None,
                      limit: int = 10, mode: str = "all") -> Dict:
-    """
-    Поиск по памяти memPalace.
-    mode: "all", "code", "convos", "docs"
-    """
+    """Поиск по памяти memPalace. mode: "all", "code", "convos", "docs" """
     d_id = dialog_ctx.get()
     args = ["search", query, "--limit", str(limit), "--mode", mode]
     if project_path:
@@ -166,12 +161,10 @@ def mempalace_search(query: str, project_path: Optional[str] = None,
     if not result["success"]:
         return {"status": "error", "error": result.get("error") or result["stderr"]}
     
-    # Пытаемся распарсить вывод как JSON (если memPalace поддерживает)
     try:
         data = json.loads(result["stdout"])
         results = data.get("results", [])
     except json.JSONDecodeError:
-        # Если не JSON, возвращаем сырой текст
         results = [{"text": result["stdout"]}]
 
     conversation_memory.add(
@@ -207,6 +200,68 @@ def mempalace_status(project_path: Optional[str] = None) -> Dict:
     else:
         return {"status": "error", "error": result.get("error") or result["stderr"]}
 
+# ─── Добавление одного документа (новая функция) ──────────────────────────
+def mempalace_add(content: str, metadata: Dict = None, project_path: Optional[str] = None) -> Dict:
+    """
+    Сохраняет один документ в memPalace и индексирует его.
+    
+    Args:
+        content: Текст документа
+        metadata: Словарь с метаданными (будет сохранён в файл-спутник)
+        project_path: Путь к проекту mempalace (если не указан, берётся из MCP_MEMPALACE_PROJECT или текущей директории)
+    """
+    d_id = dialog_ctx.get()
+    
+    if project_path is None:
+        project_path = os.environ.get("MCP_MEMPALACE_PROJECT")
+        if not project_path:
+            project_path = os.getcwd()
+    
+    proj = Path(normalize_path(project_path))
+    try:
+        _ensure_allowed(proj, "mempalace_add")
+    except PermissionError as e:
+        return {"status": "error", "message": str(e)}
+    
+    docs_dir = proj / "_mcp_docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    
+    doc_id = uuid.uuid4().hex[:12]
+    filename = f"doc_{doc_id}.txt"
+    file_path = docs_dir / filename
+    
+    try:
+        file_path.write_text(content, encoding='utf-8')
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to write document: {e}"}
+    
+    if metadata:
+        meta_path = docs_dir / f"doc_{doc_id}.meta.json"
+        meta_path.write_text(json.dumps(metadata, ensure_ascii=False, default=str), encoding='utf-8')
+    
+    # Индексируем папку _mcp_docs (инкрементально)
+    result = mempalace_mine(path=str(docs_dir), mode="files", force=False)
+    
+    if result.get("status") == "error":
+        return result
+    
+    conversation_memory.add(
+        op="mempalace_add",
+        paths={"project": str(proj), "document": str(file_path)},
+        status="success",
+        dialog=d_id,
+        context=f"Added document {filename} to mempalace project {proj.name}"
+    )
+    
+    return {
+        "status": "success",
+        "document_id": doc_id,
+        "file_path": str(file_path),
+        "project_path": str(proj),
+        "index_result": result
+    }
+
+# ─── Регистрация инструментов (обновлённая) ────────────────────────────────
 def register_tools(server: BaseMCPServer):
     server.register_tool("mempalace_init", {
         "description": "Инициализировать хранилище memPalace в проекте",
@@ -253,3 +308,17 @@ def register_tools(server: BaseMCPServer):
             "properties": {"project_path": {"type": "string"}}
         }
     }, lambda **kw: mempalace_status(kw.get("project_path")))
+
+    # Новый инструмент
+    server.register_tool("mempalace_add", {
+        "description": "Добавить один документ в память memPalace (текст, метаданные). Документ будет проиндексирован.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "Текст документа"},
+                "metadata": {"type": "object", "description": "Метаданные (например, source_file, title, date_processed)"},
+                "project_path": {"type": "string", "description": "Путь к проекту mempalace (опционально)"}
+            },
+            "required": ["content"]
+        }
+    }, lambda **kw: mempalace_add(kw["content"], kw.get("metadata"), kw.get("project_path")))
