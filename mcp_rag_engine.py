@@ -3,12 +3,16 @@
 """
 MCP RAG Engine v1.2 – инкрементальная индексация, метаданные в SQLite,
 правильная статистика, список файлов + проверка размерности эмбеддингов.
+Добавлено: rag_add_document – добавление одного документа по тексту.
 """
 import os
 import json
 import hashlib
 import sqlite3
 import time
+import tempfile
+import uuid
+import shutil
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Set, Tuple
 import threading
@@ -30,7 +34,6 @@ CHUNK_SIZE = int(os.environ.get("MCP_RAG_CHUNK_SIZE", "1000"))
 CHUNK_OVERLAP = int(os.environ.get("MCP_RAG_CHUNK_OVERLAP", "100"))
 EMBEDDING_MODEL = os.environ.get("MCP_RAG_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 TOP_K = int(os.environ.get("MCP_RAG_TOP_K", "5"))
-# Путь к БД метаданных (SQLite)
 META_DB_PATH = os.path.join(RAG_DB_PATH, "rag_meta.db")
 
 # Глобальные объекты
@@ -57,7 +60,6 @@ def _get_embedder() -> SentenceTransformer:
     return _embedder
 
 def _init_metadata_db():
-    """Создаёт SQLite таблицу для отслеживания проиндексированных файлов."""
     os.makedirs(RAG_DB_PATH, exist_ok=True)
     with sqlite3.connect(META_DB_PATH) as conn:
         conn.execute("""
@@ -74,7 +76,6 @@ def _init_metadata_db():
         conn.commit()
 
 def _get_indexed_metadata(collection_name: str) -> Dict[str, Tuple[str, float]]:
-    """Возвращает {source: (file_hash, last_modified)} для всех файлов в коллекции."""
     with sqlite3.connect(META_DB_PATH) as conn:
         cur = conn.execute(
             "SELECT source, file_hash, last_modified FROM rag_files WHERE collection_name = ?",
@@ -83,7 +84,6 @@ def _get_indexed_metadata(collection_name: str) -> Dict[str, Tuple[str, float]]:
         return {row[0]: (row[1], row[2]) for row in cur.fetchall()}
 
 def _update_file_metadata(source: str, file_hash: str, collection_name: str, mtime: float):
-    """Обновляет или вставляет запись о файле в мета-БД."""
     with sqlite3.connect(META_DB_PATH) as conn:
         conn.execute(
             """INSERT OR REPLACE INTO rag_files (source, file_hash, collection_name, indexed_at, last_modified)
@@ -93,7 +93,6 @@ def _update_file_metadata(source: str, file_hash: str, collection_name: str, mti
         conn.commit()
 
 def _delete_file_metadata(source: str, collection_name: str):
-    """Удаляет запись о файле из мета-БД."""
     with sqlite3.connect(META_DB_PATH) as conn:
         conn.execute(
             "DELETE FROM rag_files WHERE source = ? AND collection_name = ?",
@@ -102,9 +101,7 @@ def _delete_file_metadata(source: str, collection_name: str):
         conn.commit()
 
 def _remove_file_from_collection(collection, source: str):
-    """Удаляет все чанки файла из Chroma по метаданным source."""
     try:
-        # Получаем все id чанков этого файла
         result = collection.get(where={"source": source}, include=[])
         ids = result["ids"]
         if ids:
@@ -114,7 +111,6 @@ def _remove_file_from_collection(collection, source: str):
         _log(f"[RAG] Failed to remove {source}: {e}")
 
 def _file_hash_and_mtime(file_path: Path) -> Tuple[str, float]:
-    """Вычисляет хеш содержимого файла (MD5) и возвращает mtime."""
     try:
         stat = file_path.stat()
         mtime = stat.st_mtime
@@ -126,9 +122,8 @@ def _file_hash_and_mtime(file_path: Path) -> Tuple[str, float]:
         _log(f"[RAG] Error hashing {file_path}: {e}")
         return "", 0.0
 
-# ─── Извлечение текста и чанкинг (без изменений) ──────────────────────────
+# ─── Извлечение текста и чанкинг ──────────────────────────────────────────
 def extract_text(file_path: Path) -> str:
-    """Извлекает текст из PDF, DOCX, EPUB, TXT, MD."""
     ext = file_path.suffix.lower()
     if ext == '.pdf':
         text = []
@@ -188,12 +183,6 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
 def rag_index_folder(folder_path: str, collection_name: str = "default",
                      force_reindex: bool = False, incremental: bool = True,
                      cleanup_deleted: bool = False) -> Dict:
-    """
-    Индексирует папку.
-    - incremental=True: добавляет только новые/изменённые файлы.
-    - force_reindex=True: полностью пересоздаёт коллекцию (игнорирует incremental).
-    - cleanup_deleted=True: удаляет из индекса файлы, которых больше нет в папке.
-    """
     dialog_id = dialog_ctx.get()
     root = Path(normalize_path(folder_path))
     try:
@@ -206,21 +195,18 @@ def rag_index_folder(folder_path: str, collection_name: str = "default",
     client = _get_client()
     embedder = _get_embedder()
     
-    # Работа с коллекцией
     with _collection_lock:
         try:
             collection = client.get_collection(collection_name)
             if force_reindex:
                 client.delete_collection(collection_name)
                 collection = client.create_collection(collection_name)
-                # Удаляем метаданные о файлах этой коллекции
                 with sqlite3.connect(META_DB_PATH) as conn:
                     conn.execute("DELETE FROM rag_files WHERE collection_name = ?", (collection_name,))
                     conn.commit()
         except Exception:
             collection = client.create_collection(collection_name)
 
-        # ─── ПРОВЕРКА РАЗМЕРНОСТИ ЭМБЕДДИНГОВ ────────────────────────────────
         embedding_dim = embedder.get_sentence_embedding_dimension()
         try:
             sample = collection.get(limit=1, include=["embeddings"])
@@ -230,18 +216,14 @@ def rag_index_folder(folder_path: str, collection_name: str = "default",
                     _log(f"[RAG] Embedding dimension mismatch: existing {existing_dim}, new {embedding_dim}. Recreating collection.")
                     client.delete_collection(collection_name)
                     collection = client.create_collection(collection_name)
-                    # Очищаем метаданные, так как коллекция пересоздана
                     with sqlite3.connect(META_DB_PATH) as conn:
                         conn.execute("DELETE FROM rag_files WHERE collection_name = ?", (collection_name,))
                         conn.commit()
         except Exception:
-            pass  # коллекция пуста или нет эмбеддингов
-        # ─────────────────────────────────────────────────────────────────────
+            pass
 
-        # Получаем уже проиндексированные файлы (source -> (hash, mtime))
         indexed_files = _get_indexed_metadata(collection_name) if not force_reindex else {}
         
-    # Сканируем целевую папку
     supported_ext = {'.pdf', '.epub', '.docx', '.txt', '.md'}
     current_files: List[Path] = []
     for f in root.rglob("*"):
@@ -255,7 +237,6 @@ def rag_index_folder(folder_path: str, collection_name: str = "default",
     errors = 0
     total_chunks_added = 0
 
-    # Сначала обрабатываем добавленные/изменённые файлы
     for file_path in current_files:
         src = str(file_path)
         current_hash, current_mtime = _file_hash_and_mtime(file_path)
@@ -269,18 +250,15 @@ def rag_index_folder(folder_path: str, collection_name: str = "default",
             new_count += 1
         else:
             stored_hash, stored_mtime = indexed_files[src]
-            # Если хеш не совпадает (файл изменился) – переиндексируем
             if current_hash != stored_hash:
                 need_index = True
                 changed_count += 1
 
         if need_index:
-            # Удаляем старые чанки, если файл уже был
             if src in indexed_files:
                 _remove_file_from_collection(collection, src)
                 _delete_file_metadata(src, collection_name)
 
-            # Индексируем заново
             try:
                 raw_text = extract_text(file_path)
                 if not raw_text:
@@ -291,7 +269,6 @@ def rag_index_folder(folder_path: str, collection_name: str = "default",
                 if not chunks:
                     continue
 
-                # Добавляем чанки в коллекцию
                 chunk_ids = []
                 embeddings = []
                 metadatas = []
@@ -319,13 +296,11 @@ def rag_index_folder(folder_path: str, collection_name: str = "default",
                 )
                 total_chunks_added += len(chunks)
 
-                # Сохраняем метаинформацию
                 _update_file_metadata(src, current_hash, collection_name, current_mtime)
             except Exception as e:
                 _log(f"[RAG] Error indexing {file_path}: {e}")
                 errors += 1
 
-    # Опционально удаляем файлы, которых больше нет в папке
     if cleanup_deleted:
         current_sources = {str(f) for f in current_files}
         for src in indexed_files:
@@ -356,7 +331,7 @@ def rag_index_folder(folder_path: str, collection_name: str = "default",
         "cleanup_deleted": cleanup_deleted
     }
 
-# ─── Поиск, статистика, список файлов (обновлённые) ────────────────────────
+# ─── Поиск, статистика, список файлов ────────────────────────────────────────
 def rag_search(query: str, collection_name: str = "default",
                top_k: int = TOP_K) -> Dict:
     if not query.strip():
@@ -449,7 +424,6 @@ def rag_stats(collection_name: str = "default") -> Dict:
     try:
         coll = client.get_collection(collection_name)
         total_chunks = coll.count()
-        # Количество уникальных файлов из мета-БД (быстро)
         with sqlite3.connect(META_DB_PATH) as conn:
             cur = conn.execute("SELECT COUNT(*) FROM rag_files WHERE collection_name = ?", (collection_name,))
             unique_files = cur.fetchone()[0]
@@ -465,7 +439,6 @@ def rag_stats(collection_name: str = "default") -> Dict:
         return {"error": f"Collection '{collection_name}' not found or error: {e}"}
 
 def rag_list_files(collection_name: str = "default", limit: int = 100) -> Dict:
-    """Возвращает список файлов из мета-БД (быстро, без сканирования Chroma)."""
     with sqlite3.connect(META_DB_PATH) as conn:
         cur = conn.execute(
             "SELECT source, file_hash, last_modified, indexed_at FROM rag_files WHERE collection_name = ?",
@@ -492,13 +465,68 @@ def rag_delete_collection(collection_name: str) -> Dict:
     client = _get_client()
     try:
         client.delete_collection(collection_name)
-        # Удаляем метаданные
         with sqlite3.connect(META_DB_PATH) as conn:
             conn.execute("DELETE FROM rag_files WHERE collection_name = ?", (collection_name,))
             conn.commit()
         return {"status": "deleted", "collection": collection_name}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+# ─── Добавление одного документа (новая функция) ──────────────────────────
+def rag_add_document(content: str, metadata: Dict = None, collection_name: str = "default") -> Dict:
+    """
+    Добавляет один документ в RAG-коллекцию.
+    
+    Args:
+        content: Текст документа
+        metadata: Метаданные (будет добавлено к чанкам)
+        collection_name: Имя коллекции (по умолчанию "default")
+    """
+    d_id = dialog_ctx.get()
+    
+    temp_dir = Path(tempfile.gettempdir()) / f"rag_add_{uuid.uuid4().hex[:8]}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    doc_filename = f"doc_{uuid.uuid4().hex[:12]}.txt"
+    file_path = temp_dir / doc_filename
+    try:
+        file_path.write_text(content, encoding='utf-8')
+    except Exception as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return {"status": "error", "message": f"Failed to write document: {e}"}
+    
+    if metadata:
+        meta_path = temp_dir / f"{doc_filename}.meta.json"
+        meta_path.write_text(json.dumps(metadata, ensure_ascii=False, default=str), encoding='utf-8')
+    
+    try:
+        index_result = rag_index_folder(
+            folder_path=str(temp_dir),
+            collection_name=collection_name,
+            force_reindex=False,
+            incremental=True,
+            cleanup_deleted=False
+        )
+    except Exception as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return {"status": "error", "message": f"Indexing failed: {e}"}
+    
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    conversation_memory.add(
+        op="rag_add_document",
+        paths={"collection": collection_name},
+        status="success",
+        dialog=d_id,
+        context=f"Added document to RAG collection '{collection_name}', chunks: {index_result.get('chunks_added', 0)}"
+    )
+    
+    return {
+        "status": "success",
+        "collection": collection_name,
+        "chunks_added": index_result.get("chunks_added", 0),
+        "index_result": index_result
+    }
 
 # ─── Регистрация инструментов (обновлённая) ────────────────────────────────
 def register_tools(server: BaseMCPServer):
@@ -584,12 +612,26 @@ def register_tools(server: BaseMCPServer):
         }
     }, lambda **kw: rag_delete_collection(kw["collection_name"]))
 
+    # Новый инструмент
+    server.register_tool("rag_add_document", {
+        "description": "Добавить один документ в RAG-коллекцию (текст, метаданные). Документ будет разбит на чанки и проиндексирован.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "Текст документа"},
+                "metadata": {"type": "object", "description": "Метаданные (например, source_file, title)"},
+                "collection_name": {"type": "string", "default": "default", "description": "Имя коллекции"}
+            },
+            "required": ["content"]
+        }
+    }, lambda **kw: rag_add_document(kw["content"], kw.get("metadata"), kw.get("collection_name", "default")))
+
 __mcp_plugin__ = {
     "name": "rag-engine",
     "version": "1.2",
-    "description": "Инкрементальная индексация, метаданные в SQLite, проверка размерности эмбеддингов",
+    "description": "Инкрементальная индексация, метаданные в SQLite, проверка размерности эмбеддингов + добавление одного документа",
     "dependencies": ["sentence_transformers", "chromadb", "pypdf", "docx", "ebooklib", "bs4"],
-    "on_load": lambda: _log("[RAG] Engine v1.2 loaded. Incremental indexing enabled."),
+    "on_load": lambda: _log("[RAG] Engine v1.2 loaded. Incremental indexing + rag_add_document ready."),
     "on_unload": lambda: _log("[RAG] Engine unloaded.")
 }
 
